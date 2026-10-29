@@ -26,6 +26,17 @@ Code-enforced verify:
   No prompt, no model, and no flag can bypass that check in this code.
   A successful close appends a reusable known-fix entry (compounding).
 
+Structure-first retrieval (Oct 29, 2026):
+  Retrieval picks a document type first, in priority order, then the
+  best matching section inside that document, then answers only from
+  that section, citing file + section/id. This is inspired by
+  structure-aware retrieval in general, it is NOT an implementation
+  of STAIR, it is NOT embedding-based, and it makes no benchmark claim.
+  Scoring inside a section is keyword token overlap on structured
+  files. A priority tier claims a question only at >= 0.50, unless
+  a later tier beats it by more than 0.15. If no section scores
+  >= 0.30, the answer is NOT IN DOCS.
+
 Sample data only. No work code, no work SOOs, no real site names.
 Standard library only.
 """
@@ -154,54 +165,108 @@ def tokens(text):
     return {w for w in words if len(w) >= 3 and w not in STOPWORDS}
 
 
-def search_docs(vault, question):
-    """Search troubleshooting docs only. Returns (best_score, best_path, best_text)."""
-    docs = []
-    # Known fixes first: a compounded fix is the most specific citation for a repeat case.
-    for pattern in ("known-fixes.md", "sites/*/soo.md", "sites/*/as-built.md", "followups/*.md"):
-        docs.extend(sorted(vault.glob(pattern)))
+def _sections(path):
+    """Split one structured file into (label, text) sections.
+
+    known-fixes: one section per KF heading. followups: one section per
+    file. SOO / as-built / contract / state / checklist: one section
+    per bullet or non-empty line. This is the structure, not chunks.
+    """
+    text = path.read_text(encoding="utf-8")
+    if path.name == "known-fixes.md":
+        out = []
+        for chunk in text.split("## "):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            header = chunk.splitlines()[0].strip()
+            if header.lower().startswith("kf-"):
+                out.append((header, chunk))
+        return out
+    if path.parent.name == "followups":
+        return [(path.stem, text)]
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("- "):
+            out.append((path.name, line))
+        elif line and not line.startswith("#"):
+            out.append((path.name, line))
+    return out
+
+
+def search_structured(vault, question):
+    """Structure-first retrieval.
+
+    Tier order, picked first, then best section inside that tier:
+    1 known-fixes sections, 2 followups, 3 SOO, 4 as-built,
+    5 contract/state/checklist, only as a fallback.
+    Returns (score, path, section_label, section_text) or (0, None, "", "").
+    A priority tier claims the question only if its best section
+    scores >= 0.50. If a later tier beats that tier by more than
+    0.15, the later, clearly better section wins instead, so a weak
+    high-priority match cannot beat a strong lower-tier match.
+    Exception: a known-fix section at >= 0.50 always wins, because
+    a compounded fix is the most specific answer for a repeat case.
+    If no tier reaches 0.50, the overall best section wins only if
+    it scores >= 0.30, otherwise the answer is NOT IN DOCS.
+    """
     q = tokens(question)
     if not q:
-        return 0.0, None, ""
-    best = (0.0, None, "")
-    for p in docs:
-        text = p.read_text(encoding="utf-8")
-        score = len(q & tokens(text)) / len(q)
-        # A compounded known fix is the most specific answer for a repeat case:
-        # give it priority over a general SOO line, but only when it really matches.
-        if p.name == "known-fixes.md" and score >= 0.5:
-            score = min(1.1, score + 0.3)
-        if score > best[0]:
-            best = (score, p, text)
-    return best
+        return 0.0, None, "", ""
+    tiers = [
+        sorted(vault.glob("known-fixes.md")),
+        sorted((vault / "followups").glob("*.md")) if (vault / "followups").exists() else [],
+        sorted(vault.glob("sites/*/soo.md")),
+        sorted(vault.glob("sites/*/as-built.md")),
+    ]
+    fallback = []
+    for name in ("contract.md", "state.md", "checklist.md"):
+        p = vault / name
+        if p.exists():
+            fallback.append(p)
+    tiers.append(fallback)
+    per_tier = []
+    for tier in tiers:
+        best = (0.0, None, "", "")
+        for p in tier:
+            for label, section in _sections(p):
+                overlap = len(q & tokens(section))
+                score = overlap / len(q) if q else 0.0
+                if score > best[0]:
+                    best = (score, p, label, section)
+        per_tier.append(best)
+    overall = max(per_tier, key=lambda b: b[0])
+    if overall[1] is None or overall[0] < 0.30:
+        return 0.0, None, "", ""
+    # A compounded known fix at >= 0.50 always wins: it is the most
+    # specific answer for a repeat case, and must be cited as KF-.
+    if per_tier[0][1] is not None and per_tier[0][0] >= 0.50:
+        return per_tier[0]
+    for best in per_tier[1:]:
+        if best[1] is not None and best[0] >= 0.50 and best[0] >= overall[0] - 0.15:
+            return best
+    return overall
+
+
+def search_docs(vault, question):
+    """Backward-compatible wrapper: returns (best_score, best_path, best_text)."""
+    score, path, _label, section = search_structured(vault, question)
+    return score, path, section
 
 
 def grounded_answer(vault, question):
-    score, path, text = search_docs(vault, question)
+    score, path, label, section = search_structured(vault, question)
     if path is None or score < 0.30:
         return (
             "NOT IN DOCS: this question is not covered by the sample docs. "
             "No step is invented. Escalate to the sample site lead and "
             "record it as a new follow-up with its source question."
         )
-    # Return the most relevant line(s) from the matched doc, with citation.
-    q = tokens(question)
-    lines = []
-    for line in text.splitlines():
-        if len(q & tokens(line)) >= 2:
-            lines.append(line.strip())
-    snippet = " ".join(lines[:3]) if lines else text.splitlines()[0] if text else ""
-    if path.name == "known-fixes.md":
-        # Prepend the matching KF section header so a repeat case cites the fix id.
-        best_section, best_score = "", 0
-        for section in text.split("## "):
-            s = len(q & tokens(section))
-            if s > best_score:
-                best_section, best_score = section, s
-        header = best_section.splitlines()[0].strip() if best_section else ""
-        if header:
-            snippet = f"{header}: {snippet}"
-    return f"Grounded answer, cited from {path.name} ({path.parent.name}): {snippet}"
+    snippet = section.strip()
+    if label and label != path.name:
+        snippet = f"{label}: {snippet}"
+    return f"Grounded answer, cited from {path.name} section {label} ({path.parent.name}): {snippet}"
 
 
 def cmd_pickup(args):

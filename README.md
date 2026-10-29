@@ -36,6 +36,27 @@ python3 seed.py   # reset to the clean sample vault
 - `followup`: bring all open F numbers to bear. `--close Fxx` attempts a close.
 - `wrapup`: close the day, carry open items forward.
 
+## Structure-first retrieval, Oct 29, 2026
+
+Retrieval picks a document type first, in priority order, then the
+best matching section inside that document, then answers only from
+that section, citing file + section/id:
+1. known-fixes.md sections (KF-), 2. followups/*.md, 3. sites/*/soo.md,
+4. sites/*/as-built.md, 5. contract/state/checklist, only as a fallback.
+
+Rules, stated honestly: scoring inside a section is keyword token
+overlap on structured files. A priority tier claims a question only
+at >= 0.50. A later tier that beats it by more than 0.15 wins instead,
+so a weak high-priority match cannot beat a strong lower-tier match.
+Exception: a known-fix section at >= 0.50 always wins, because a
+compounded fix is the most specific answer for a repeat case.
+If no section scores >= 0.30, the answer is NOT IN DOCS.
+
+This is inspired by structure-aware retrieval in general. It is NOT
+an implementation of STAIR, it is NOT embedding-based, and it makes
+no benchmark claim. It is a structured RAG application with a ledger
+and a control layer on top, not a new retriever model.
+
 ## Code-enforced verify, not a prompt
 
 `followup --close Fxx` is refused by code, exit code 2, file unchanged, if
@@ -66,10 +87,11 @@ case then cites that KF entry, not just the general SOO.
 If `NEBIUS_TOKEN_FACTORY_API_KEY` is not set, the app runs in clearly
 labelled DEMO MODE: summaries are file-generated, and no live Token
 Factory call is made or claimed. Tests and the demo flow work in demo
-mode. A live Token Factory code call with a real key is still to be
-proven by the author before submission, because the account balance
-was $0.00 at setup and a promo code was rejected. Do not claim a live
-call from a demo-mode run.
+mode. A live Token Factory Playground call was proven Oct 29, 2026
+with nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B, about 2 seconds, balance
+$0.00, no top-up. A live Token Factory code call with a real key is
+still to be proven by the author before submission. Do not claim a
+live code call from a demo-mode run.
 
 Set a key only via environment, never in a file or in chat:
 
@@ -119,11 +141,18 @@ python3 -m unittest discover -s tests -v
 python3 baseline.py
 ```
 
-Runs 5 sample tickets, grounded vs model-alone, with keyword/citation
-scoring defined in `tickets.json`. If no Token Factory key is set,
-model-alone is reported SKIPPED and the comparison INCONCLUSIVE, not
-invented. The sample is tiny; it is not a benchmark, and must not be
-quoted as a general accuracy claim.
+Runs 20 invented sample tickets, grounded structured retrieval vs
+a simple naive chunk baseline vs model-alone, with keyword/citation
+scoring defined in `tickets.json`. The naive baseline joins the seed
+docs, splits them into 200-character chunks, returns the best keyword
+chunk, with no structure, no citation enforcement, and no NOT IN DOCS
+rule, so it answers uncovered questions instead of refusing them.
+If no Token Factory key is set, model-alone is reported SKIPPED and
+the comparison vs model-alone INCONCLUSIVE, not invented.
+Latest run, Oct 29, 2026, no key present: grounded structured 20/20,
+naive chunk 10/20, model-alone SKIPPED. The sample is tiny and
+invented; it is not a benchmark, and must not be quoted as a general
+accuracy claim. Do not generalise beyond this sample.
 
 ## What is NOT in this build, on purpose
 
